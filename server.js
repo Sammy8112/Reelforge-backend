@@ -1,7 +1,7 @@
 // REELFORGE backend — handles video generation requests.
 // The video-provider API key lives ONLY here, as an environment variable,
 // never in frontend code. The browser talks to this server; this server
-// talks to the video provider.
+// talks to the video provider (Segmind, using their Seedance 2.0 model).
 
 const express = require('express');
 const cors = require('cors');
@@ -13,11 +13,11 @@ app.use(express.json());
 const PORT = process.env.PORT || 3001;
 
 // ---- Config ----
-// Set these in your hosting provider's environment variables, never in code.
-const KLING_API_KEY = process.env.KLING_API_KEY;
-// Kling's international API is served from the Singapore region.
-const KLING_BASE_URL = 'https://api-singapore.klingai.com';
-const KLING_CREATE_URL = `${KLING_BASE_URL}/v1/videos/text2video`;
+// Set this in your hosting provider's environment variables, never in code.
+const SEGMIND_API_KEY = process.env.SEGMIND_API_KEY;
+const SEGMIND_SUBMIT_URL = 'https://api.segmind.com/v2/seedance-2.0';
+const SEGMIND_STATUS_URL = (id) => `https://api.segmind.com/v2/requests/${id}/status`;
+const SEGMIND_RESULT_URL = (id) => `https://api.segmind.com/v2/requests/${id}`;
 
 // In-memory job store. Fine for a demo; swap for a real database (Postgres,
 // SQLite, etc.) once you have real users and need jobs to survive a restart.
@@ -25,7 +25,7 @@ const jobs = {};
 
 // ---- Health check ----
 app.get('/api/health', (req, res) => {
-  res.json({ ok: true, mode: KLING_API_KEY ? 'live' : 'mock' });
+  res.json({ ok: true, mode: SEGMIND_API_KEY ? 'live' : 'mock' });
 });
 
 // ---- Kick off a video generation job ----
@@ -38,63 +38,58 @@ app.post('/api/generate', async (req, res) => {
 
   const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
 
-  // MOCK MODE — runs automatically until you add a real KLING_API_KEY.
+  // MOCK MODE — runs automatically until you add a real SEGMIND_API_KEY.
   // Lets you test the full frontend <-> backend flow before paying for
   // any real generations.
-  if (!KLING_API_KEY) {
+  if (!SEGMIND_API_KEY) {
     jobs[jobId] = { status: 'queued', progress: 0, videoUrl: null, prompt, style, ratio };
     simulateMockRender(jobId);
     return res.json({ jobId, mode: 'mock' });
   }
 
-  // LIVE MODE — real call to the video provider.
+  // LIVE MODE — real call to Segmind.
   try {
-    const response = await fetch(KLING_CREATE_URL, {
+    const response = await fetch(SEGMIND_SUBMIT_URL, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'Authorization': `Bearer ${KLING_API_KEY}`
+        'x-api-key': SEGMIND_API_KEY
       },
       body: JSON.stringify({
-        model_name: 'kling-v2-6',
         prompt: `${prompt}, ${style} style`,
-        negative_prompt: '',
-        duration: '5',
-        mode: 'std',
-        sound: 'off',
+        duration: 5,
+        resolution: '720p',
         aspect_ratio: ratio,
-        callback_url: '',
-        external_task_id: jobId
+        generate_audio: false
       })
     });
 
     const data = await response.json();
 
-    if (!response.ok || !data?.data?.task_id) {
-      console.error('Kling create-task error:', response.status, JSON.stringify(data));
+    if (!response.ok || !data?.request_id) {
+      console.error('Segmind submit error:', response.status, JSON.stringify(data));
       return res.status(502).json({ error: 'Video provider error', detail: data });
     }
 
-    const klingTaskId = data.data.task_id;
-    jobs[jobId] = { status: 'processing', progress: 5, videoUrl: null, klingTaskId };
-    pollKlingTask(jobId, klingTaskId);
+    jobs[jobId] = { status: 'processing', progress: 5, videoUrl: null, segmindRequestId: data.request_id };
+    pollSegmindJob(jobId, data.request_id);
     return res.json({ jobId, mode: 'live' });
   } catch (err) {
-    console.error('Kling request failed:', err);
+    console.error('Segmind request failed:', err);
     return res.status(500).json({ error: 'Failed to reach video provider', detail: String(err) });
   }
 });
 
-// ---- Poll job status ----
+// ---- Poll job status (called by the frontend) ----
 app.get('/api/status/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
 });
 
-// ---- Poll Kling's actual task status until it's done ----
-async function pollKlingTask(jobId, klingTaskId) {
-  const maxAttempts = 40; // ~ up to a few minutes, generous for video gen
+// ---- Poll Segmind's actual task status until it's done ----
+async function pollSegmindJob(jobId, requestId) {
+  const maxAttempts = 60; // video gen can take a few minutes
   let attempts = 0;
 
   const check = async () => {
@@ -102,42 +97,44 @@ async function pollKlingTask(jobId, klingTaskId) {
     attempts++;
 
     try {
-      const res = await fetch(`${KLING_CREATE_URL}/${klingTaskId}`, {
-        headers: { 'Authorization': `Bearer ${KLING_API_KEY}` }
+      const statusRes = await fetch(SEGMIND_STATUS_URL(requestId), {
+        headers: { 'x-api-key': SEGMIND_API_KEY }
       });
-      const data = await res.json();
-      const task = data?.data;
+      const statusData = await statusRes.json();
 
-      if (task?.task_status === 'succeed') {
-        const videoUrl = task?.task_result?.videos?.[0]?.url;
+      if (statusData.status === 'COMPLETED') {
+        const resultRes = await fetch(SEGMIND_RESULT_URL(requestId), {
+          headers: { 'x-api-key': SEGMIND_API_KEY }
+        });
+        const resultData = await resultRes.json();
         jobs[jobId].status = 'complete';
         jobs[jobId].progress = 100;
-        jobs[jobId].videoUrl = videoUrl || null;
+        jobs[jobId].videoUrl = resultData?.output || null;
         return;
       }
 
-      if (task?.task_status === 'failed') {
+      if (statusData.status === 'FAILED') {
         jobs[jobId].status = 'error';
-        jobs[jobId].error = task?.task_status_msg || 'Kling reported generation failure';
+        jobs[jobId].error = statusData?.error || 'Segmind reported generation failure';
         return;
       }
 
-      // still processing
-      jobs[jobId].progress = Math.min(90, 10 + attempts * 5);
+      // still QUEUED or PROCESSING
+      jobs[jobId].progress = Math.min(90, 10 + attempts * 3);
 
       if (attempts < maxAttempts) {
-        setTimeout(check, 4000);
+        setTimeout(check, 5000);
       } else {
         jobs[jobId].status = 'error';
-        jobs[jobId].error = 'Timed out waiting for Kling';
+        jobs[jobId].error = 'Timed out waiting for Segmind';
       }
     } catch (err) {
-      console.error('Kling poll error:', err);
+      console.error('Segmind poll error:', err);
       if (attempts < maxAttempts) {
-        setTimeout(check, 4000);
+        setTimeout(check, 5000);
       } else {
         jobs[jobId].status = 'error';
-        jobs[jobId].error = 'Failed to poll Kling status';
+        jobs[jobId].error = 'Failed to poll Segmind status';
       }
     }
   };
@@ -166,5 +163,5 @@ function simulateMockRender(jobId) {
 
 app.listen(PORT, () => {
   console.log(`REELFORGE backend running on port ${PORT}`);
-  console.log(`Mode: ${KLING_API_KEY ? 'LIVE (using real API key)' : 'MOCK (no KLING_API_KEY set yet)'}`);
+  console.log(`Mode: ${SEGMIND_API_KEY ? 'LIVE (using real Segmind API key)' : 'MOCK (no SEGMIND_API_KEY set yet)'}`);
 });
