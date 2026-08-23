@@ -58,7 +58,7 @@ app.post('/api/generate', async (req, res) => {
       body: JSON.stringify({
         prompt: `${prompt}, ${style} style`,
         duration: 5,
-        resolution: quality === 'pro' ? '1080p' : '720p',
+        resolution: quality === '4k' ? '4k' : quality === 'pro' ? '1080p' : '720p',
         aspect_ratio: ratio,
         generate_audio: false
       })
