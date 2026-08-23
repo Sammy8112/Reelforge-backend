@@ -30,7 +30,7 @@ app.get('/api/health', (req, res) => {
 
 // ---- Kick off a video generation job ----
 app.post('/api/generate', async (req, res) => {
-  const { prompt, style, ratio } = req.body;
+  const { prompt, style, ratio, quality } = req.body;
 
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ error: 'A prompt is required.' });
@@ -58,7 +58,7 @@ app.post('/api/generate', async (req, res) => {
       body: JSON.stringify({
         prompt: `${prompt}, ${style} style`,
         duration: 5,
-        resolution: '720p',
+        resolution: quality === 'pro' ? '1080p' : '720p',
         aspect_ratio: ratio,
         generate_audio: false
       })
