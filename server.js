@@ -5,12 +5,128 @@
 
 const express = require('express');
 const cors = require('cors');
+const Stripe = require('stripe');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
-app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
+
+// ---- Stripe / Supabase config (all from environment variables) ----
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
+const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
+const SITE_URL = process.env.SITE_URL || 'https://sammy8112.github.io/Reelforge-frontend/';
+
+const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
+
+// Service-role client: can update any profile. Backend only, never the browser.
+const supaAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+  : null;
+
+// What each thing costs and how many credits it grants.
+const PACKS = {
+  payg:    { name: 'REELFORGE — 6 credits',  amount: 1000, credits: 6,  mode: 'payment' },
+  creator: { name: 'REELFORGE Creator',      amount: 3125, credits: 25, mode: 'subscription' },
+  studio:  { name: 'REELFORGE Studio',       amount: 7000, credits: 80, mode: 'subscription' }
+};
+
+// ---- Stripe webhook ----
+// Registered BEFORE express.json() because signature checking needs the raw body.
+app.post('/api/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe || !STRIPE_WEBHOOK_SECRET) return res.status(500).send('Stripe not configured');
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.headers['stripe-signature'], STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    if (event.type === 'checkout.session.completed') {
+      const session = event.data.object;
+      await grantCredits(session.metadata.user_id, parseInt(session.metadata.credits, 10), event.id);
+    }
+
+    // Monthly subscription renewals
+    if (event.type === 'invoice.paid' && event.data.object.billing_reason === 'subscription_cycle') {
+      const invoice = event.data.object;
+      const sub = await stripe.subscriptions.retrieve(invoice.subscription);
+      await grantCredits(sub.metadata.user_id, parseInt(sub.metadata.credits, 10), event.id);
+    }
+  } catch (err) {
+    console.error('Webhook handling error:', err);
+    return res.status(500).send('handler failed');
+  }
+
+  res.json({ received: true });
+});
+
+// Adds credits to a user. Records the Stripe event id so a repeated
+// webhook delivery can't grant the same credits twice.
+async function grantCredits(userId, credits, eventId) {
+  if (!supaAdmin || !userId || !credits) {
+    console.error('grantCredits missing data', { userId, credits });
+    return;
+  }
+  const { error } = await supaAdmin.rpc('grant_credits', {
+    target_user: userId,
+    amount: credits,
+    event_id: eventId
+  });
+  if (error) console.error('grant_credits failed:', error);
+  else console.log(`Granted ${credits} credits to ${userId}`);
+}
+
+app.use(express.json({ limit: '10mb' }));
+
+// ---- Create a Stripe Checkout session ----
+app.post('/api/checkout', async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Payments not configured yet.' });
+  if (!supaAdmin) return res.status(500).json({ error: 'Server not configured.' });
+
+  const { pack, accessToken } = req.body;
+  const chosen = PACKS[pack];
+  if (!chosen) return res.status(400).json({ error: 'Unknown pack.' });
+
+  // Verify the user really is who they say they are
+  const { data: userData, error: userErr } = await supaAdmin.auth.getUser(accessToken);
+  if (userErr || !userData || !userData.user) {
+    return res.status(401).json({ error: 'Please log in again.' });
+  }
+  const user = userData.user;
+
+  try {
+    const priceData = {
+      currency: 'gbp',
+      product_data: { name: chosen.name },
+      unit_amount: chosen.amount
+    };
+    if (chosen.mode === 'subscription') priceData.recurring = { interval: 'month' };
+
+    const session = await stripe.checkout.sessions.create({
+      mode: chosen.mode,
+      line_items: [{ price_data: priceData, quantity: 1 }],
+      customer_email: user.email,
+      success_url: `${SITE_URL}?purchase=success`,
+      cancel_url: `${SITE_URL}?purchase=cancelled`,
+      metadata: { user_id: user.id, credits: String(chosen.credits) },
+      subscription_data: chosen.mode === 'subscription'
+        ? { metadata: { user_id: user.id, credits: String(chosen.credits) } }
+        : undefined
+    });
+
+    res.json({ url: session.url });
+  } catch (err) {
+    console.error('Checkout error:', err);
+    res.status(500).json({ error: 'Could not start checkout.' });
+  }
+});
 
 // ---- Config ----
 // Set this in your hosting provider's environment variables, never in code.
