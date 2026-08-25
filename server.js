@@ -180,7 +180,7 @@ app.post('/api/generate', async (req, res) => {
         duration: parseInt(duration, 10) || 5,
         resolution: quality || '720p',
         aspect_ratio: ratio,
-        generate_audio: false
+        generate_audio: true
       }, image ? { image } : {}))
     });
 
