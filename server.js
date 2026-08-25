@@ -15,7 +15,8 @@ const PORT = process.env.PORT || 3001;
 // ---- Config ----
 // Set this in your hosting provider's environment variables, never in code.
 const SEGMIND_API_KEY = process.env.SEGMIND_API_KEY;
-const SEGMIND_SUBMIT_URL = 'https://api.segmind.com/v2/seedance-2.0';
+const SEGMIND_BASE = 'https://api.segmind.com/v2';
+const MODEL_IDS = { 'seedance-2.0': 'seedance-2.0', 'seedance-2.5': 'seedance-2.5' };
 const SEGMIND_STATUS_URL = (id) => `https://api.segmind.com/v2/requests/${id}/status`;
 const SEGMIND_RESULT_URL = (id) => `https://api.segmind.com/v2/requests/${id}`;
 
@@ -30,7 +31,7 @@ app.get('/api/health', (req, res) => {
 
 // ---- Kick off a video generation job ----
 app.post('/api/generate', async (req, res) => {
-  const { prompt, style, ratio, quality, image } = req.body;
+  const { prompt, ratio, model, quality, duration, image } = req.body;
 
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ error: 'A prompt is required.' });
@@ -42,23 +43,24 @@ app.post('/api/generate', async (req, res) => {
   // Lets you test the full frontend <-> backend flow before paying for
   // any real generations.
   if (!SEGMIND_API_KEY) {
-    jobs[jobId] = { status: 'queued', progress: 0, videoUrl: null, prompt, style, ratio };
+    jobs[jobId] = { status: 'queued', progress: 0, videoUrl: null, prompt, ratio, model, quality, duration };
     simulateMockRender(jobId);
     return res.json({ jobId, mode: 'mock' });
   }
 
   // LIVE MODE — real call to Segmind.
   try {
-    const response = await fetch(SEGMIND_SUBMIT_URL, {
+    const modelId = MODEL_IDS[model] || 'seedance-2.0';
+    const response = await fetch(`${SEGMIND_BASE}/${modelId}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         'x-api-key': SEGMIND_API_KEY
       },
       body: JSON.stringify(Object.assign({
-        prompt: `${prompt}, ${style} style`,
-        duration: 5,
-        resolution: quality === '4k' ? '4k' : quality === 'pro' ? '1080p' : '720p',
+        prompt: prompt,
+        duration: parseInt(duration, 10) || 5,
+        resolution: quality || '720p',
         aspect_ratio: ratio,
         generate_audio: false
       }, image ? { image } : {}))
