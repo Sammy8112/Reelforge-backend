@@ -29,9 +29,11 @@ const supaAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
 
 // What each thing costs and how many credits it grants.
 const PACKS = {
-  payg:    { name: 'REELFORGE — 6 credits',  amount: 1000, credits: 6,  mode: 'payment' },
+  payg10:  { name: 'REELFORGE — 6 credits',  amount: 1000, credits: 6,  mode: 'payment' },
+  payg20:  { name: 'REELFORGE — 13 credits', amount: 2000, credits: 13, mode: 'payment' },
+  payg30:  { name: 'REELFORGE — 20 credits', amount: 3000, credits: 20, mode: 'payment' },
   creator: { name: 'REELFORGE Creator',      amount: 3125, credits: 25, mode: 'subscription' },
-  studio:  { name: 'REELFORGE Studio',       amount: 7000, credits: 80, mode: 'subscription' }
+  studio:  { name: 'REELFORGE Studio',       amount: 8000, credits: 80, mode: 'subscription' }
 };
 
 // ---- Stripe webhook ----
