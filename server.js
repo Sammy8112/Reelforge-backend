@@ -179,9 +179,9 @@ app.post('/api/generate', async (req, res) => {
         prompt: prompt,
         duration: parseInt(duration, 10) || 5,
         resolution: quality || '720p',
-        aspect_ratio: ratio,
+        aspect_ratio: image ? 'adaptive' : ratio,
         generate_audio: true
-      }, image ? { image } : {}))
+      }, image ? { first_frame_url: image } : {}))
     });
 
     const data = await response.json();
