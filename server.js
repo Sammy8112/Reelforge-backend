@@ -30,7 +30,7 @@ app.get('/api/health', (req, res) => {
 
 // ---- Kick off a video generation job ----
 app.post('/api/generate', async (req, res) => {
-  const { prompt, style, ratio, quality } = req.body;
+  const { prompt, style, ratio, quality, image } = req.body;
 
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ error: 'A prompt is required.' });
@@ -55,13 +55,13 @@ app.post('/api/generate', async (req, res) => {
         'Content-Type': 'application/json',
         'x-api-key': SEGMIND_API_KEY
       },
-      body: JSON.stringify({
+      body: JSON.stringify(Object.assign({
         prompt: `${prompt}, ${style} style`,
         duration: 5,
         resolution: quality === '4k' ? '4k' : quality === 'pro' ? '1080p' : '720p',
         aspect_ratio: ratio,
         generate_audio: false
-      })
+      }, image ? { image } : {}))
     });
 
     const data = await response.json();
