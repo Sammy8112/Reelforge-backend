@@ -141,6 +141,96 @@ async function refundCreditsFor(userId, amount) {
   else console.log(`Refunded ${amount} credits to ${userId}`);
 }
 
+// How many finished clips we keep playable per user. Older ones have their
+// video file deleted from storage, but the history row stays — so the user
+// still sees what they made, it just can't be played back any more.
+const KEEP_PER_USER = 10;
+
+// Deletes the stored video files for everything beyond the newest
+// KEEP_PER_USER renders. Keeps storage flat no matter how much someone makes.
+async function pruneOldRenders(userId) {
+  if (!supaAdmin || !userId) return;
+  try {
+    const { data, error } = await supaAdmin
+      .from('renders')
+      .select('id, storage_path')
+      .eq('user_id', userId)
+      .not('storage_path', 'is', null)
+      .order('created_at', { ascending: false })
+      .range(KEEP_PER_USER, KEEP_PER_USER + 199);
+
+    if (error) throw error;
+    if (!data || !data.length) return;
+
+    const paths = data.map(r => r.storage_path).filter(Boolean);
+    if (!paths.length) return;
+
+    const { error: delErr } = await supaAdmin.storage.from('renders').remove(paths);
+    if (delErr) throw delErr;
+
+    // Clear the path so we don't try to delete these again, and so the
+    // profile page knows the clip has expired.
+    const { error: updErr } = await supaAdmin
+      .from('renders')
+      .update({ storage_path: null, video_url: null })
+      .in('id', data.map(r => r.id));
+    if (updErr) throw updErr;
+
+    console.log(`Pruned ${paths.length} old clip(s) for ${userId}`);
+  } catch (err) {
+    console.error('pruneOldRenders failed:', err);
+  }
+}
+
+// Copies a finished render into our own storage and records it, so the
+// user's profile gallery still works after the provider's URL expires.
+// Best-effort: if archiving fails the user still gets their video, they
+// just won't see it in their gallery later.
+async function archiveRender(job, providerUrl) {
+  if (!supaAdmin || !job || !job.userId || !providerUrl) return providerUrl;
+
+  try {
+    const videoRes = await fetch(providerUrl);
+    if (!videoRes.ok) throw new Error('download failed: ' + videoRes.status);
+    const buffer = Buffer.from(await videoRes.arrayBuffer());
+
+    const path = `${job.userId}/${Date.now()}-${Math.random().toString(36).slice(2, 8)}.mp4`;
+
+    const { error: upErr } = await supaAdmin.storage
+      .from('renders')
+      .upload(path, buffer, { contentType: 'video/mp4', upsert: false });
+    if (upErr) throw upErr;
+
+    const { data: pub } = supaAdmin.storage.from('renders').getPublicUrl(path);
+    const storedUrl = pub?.publicUrl || providerUrl;
+
+    const { error: insErr } = await supaAdmin.from('renders').insert({
+      user_id: job.userId,
+      video_url: storedUrl,
+      storage_path: path,
+      prompt: job.prompt || null,
+      model: job.model || null,
+      quality: job.quality || null,
+      ratio: job.ratio || null,
+      duration: job.duration ? parseInt(job.duration, 10) : null,
+      credits: job.cost || null
+    });
+    if (insErr) throw insErr;
+
+    console.log(`Archived render for ${job.userId} -> ${path}`);
+
+    // Keep only the newest few clips per user so storage stays bounded.
+    await pruneOldRenders(job.userId);
+
+    return storedUrl;
+  } catch (err) {
+    // Don't fail the render over this — the user already paid and the
+    // clip exists. They just lose the gallery entry.
+    console.error('archiveRender failed:', err);
+    return providerUrl;
+  }
+}
+
 app.use(express.json({ limit: '10mb' }));
 
 // ---- Create a Stripe Checkout session ----
@@ -280,6 +370,7 @@ app.post('/api/generate', async (req, res) => {
     jobs[jobId] = {
       status: 'processing', progress: 5, videoUrl: null,
       segmindRequestId: data.request_id,
+      prompt, ratio, model, quality, duration,
       userId, cost, refunded: false
     };
     pollSegmindJob(jobId, data.request_id);
@@ -328,9 +419,18 @@ async function pollSegmindJob(jobId, requestId) {
           headers: { 'x-api-key': SEGMIND_API_KEY }
         });
         const resultData = await resultRes.json();
+        const providerUrl = resultData?.output || null;
+
+        // Copy it into our own storage so it survives the provider's
+        // link expiring, then serve that copy to the browser.
+        const finalUrl = providerUrl
+          ? await archiveRender(jobs[jobId], providerUrl)
+          : null;
+
+        if (!jobs[jobId]) return; // job cleared while we were archiving
         jobs[jobId].status = 'complete';
         jobs[jobId].progress = 100;
-        jobs[jobId].videoUrl = resultData?.output || null;
+        jobs[jobId].videoUrl = finalUrl;
         return;
       }
 
