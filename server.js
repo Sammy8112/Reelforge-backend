@@ -1,7 +1,7 @@
 // REELFORGE backend — handles video generation requests.
 // The video-provider API key lives ONLY here, as an environment variable,
 // never in frontend code. The browser talks to this server; this server
-// talks to the video provider (Segmind, using their Seedance 2.0 model).
+// talks to the video provider (Segmind, using their Seedance models).
 
 const express = require('express');
 const cors = require('cors');
@@ -18,7 +18,7 @@ const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 const STRIPE_WEBHOOK_SECRET = process.env.STRIPE_WEBHOOK_SECRET;
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
-const SITE_URL = process.env.SITE_URL || 'https://sammy8112.github.io/Reelforge-frontend/';
+const SITE_URL = process.env.SITE_URL || 'https://reelforge.dev';
 
 const stripe = STRIPE_SECRET_KEY ? new Stripe(STRIPE_SECRET_KEY) : null;
 
@@ -28,13 +28,42 @@ const supaAdmin = (SUPABASE_URL && SUPABASE_SERVICE_KEY)
   : null;
 
 // What each thing costs and how many credits it grants.
+// Credits are counted in hundredths: 100 credits ~= a 5s 720p Seedance 2.0 render.
 const PACKS = {
-  payg10:  { name: 'REELFORGE — 6 credits',  amount: 1000, credits: 6,  mode: 'payment' },
-  payg20:  { name: 'REELFORGE — 13 credits', amount: 2000, credits: 13, mode: 'payment' },
-  payg30:  { name: 'REELFORGE — 20 credits', amount: 3000, credits: 20, mode: 'payment' },
-  creator: { name: 'REELFORGE Creator',      amount: 3125, credits: 25, mode: 'subscription' },
-  studio:  { name: 'REELFORGE Studio',       amount: 8000, credits: 80, mode: 'subscription' }
+  payg10:  { name: 'REELFORGE — 600 credits',   amount: 1000, credits: 600,  mode: 'payment' },
+  payg20:  { name: 'REELFORGE — 1,300 credits', amount: 2000, credits: 1300, mode: 'payment' },
+  payg30:  { name: 'REELFORGE — 2,000 credits', amount: 3000, credits: 2000, mode: 'payment' },
+  creator: { name: 'REELFORGE Creator',         amount: 3125, credits: 2500, mode: 'subscription' },
+  studio:  { name: 'REELFORGE Studio',          amount: 8000, credits: 8000, mode: 'subscription' }
 };
+
+// ---- Credit pricing ----
+// Credits charged per second of output. MUST stay in sync with index.html.
+// Derived from Segmind's published per-second API rates plus margin.
+const CREDIT_RATES = {
+  'seedance-2.0': { '480p': 10, '720p': 20, '1080p': 45, '4k': 180 },
+  'seedance-2.5': { '480p': 17, '720p': 35, '1080p': 85 }
+};
+
+const DURATION_LIMITS = {
+  'seedance-2.0': { min: 4, max: 15 },
+  'seedance-2.5': { min: 4, max: 30 }
+};
+
+const VALID_RATIOS = ['9:16', '1:1', '16:9', 'adaptive'];
+
+// Returns the cost in credits, or null if the combination isn't allowed.
+// This is the authority on pricing — never trust a number sent by the browser.
+function creditCost(model, quality, duration) {
+  const rates = CREDIT_RATES[model];
+  if (!rates) return null;
+  const rate = rates[quality];
+  if (!rate) return null;
+  const limits = DURATION_LIMITS[model];
+  const d = Number(duration);
+  if (!Number.isInteger(d) || d < limits.min || d > limits.max) return null;
+  return Math.ceil(rate * d);
+}
 
 // ---- Stripe webhook ----
 // Registered BEFORE express.json() because signature checking needs the raw body.
@@ -83,6 +112,33 @@ async function grantCredits(userId, credits, eventId) {
   });
   if (error) console.error('grant_credits failed:', error);
   else console.log(`Granted ${credits} credits to ${userId}`);
+}
+
+// Deducts credits from a user, backend-side. Returns the new balance,
+// or -1 if they don't have enough. Uses spend_credits_for (service-role only)
+// because spend_credits relies on auth.uid(), which is null for the backend.
+async function spendCreditsFor(userId, amount) {
+  if (!supaAdmin) return -1;
+  const { data, error } = await supaAdmin.rpc('spend_credits_for', {
+    target_user: userId,
+    amount: amount
+  });
+  if (error) {
+    console.error('spend_credits_for failed:', error);
+    return -1;
+  }
+  return data;
+}
+
+// Gives credits back when a render fails, so nobody pays for nothing.
+async function refundCreditsFor(userId, amount) {
+  if (!supaAdmin || !userId || !amount) return;
+  const { error } = await supaAdmin.rpc('spend_credits_for', {
+    target_user: userId,
+    amount: -amount
+  });
+  if (error) console.error('refund failed:', error);
+  else console.log(`Refunded ${amount} credits to ${userId}`);
 }
 
 app.use(express.json({ limit: '10mb' }));
@@ -149,10 +205,35 @@ app.get('/api/health', (req, res) => {
 
 // ---- Kick off a video generation job ----
 app.post('/api/generate', async (req, res) => {
-  const { prompt, ratio, model, quality, duration, image } = req.body;
+  const { prompt, ratio, model, quality, duration, image, accessToken } = req.body;
 
   if (!prompt || !prompt.trim()) {
     return res.status(400).json({ error: 'A prompt is required.' });
+  }
+  if (!supaAdmin) {
+    return res.status(500).json({ error: 'Server not configured.' });
+  }
+
+  // Who is this? Verified against Supabase, not taken on trust.
+  const { data: userData, error: userErr } = await supaAdmin.auth.getUser(accessToken);
+  if (userErr || !userData || !userData.user) {
+    return res.status(401).json({ error: 'Please log in again.' });
+  }
+  const userId = userData.user.id;
+
+  // Work out the price here. The browser's opinion of the cost is ignored.
+  const cost = creditCost(model, quality, duration);
+  if (cost === null) {
+    return res.status(400).json({ error: 'Invalid model, resolution or length.' });
+  }
+  if (ratio && VALID_RATIOS.indexOf(ratio) === -1) {
+    return res.status(400).json({ error: 'Invalid aspect ratio.' });
+  }
+
+  // Take the credits before doing any work.
+  const newBalance = await spendCreditsFor(userId, cost);
+  if (newBalance === -1) {
+    return res.status(402).json({ error: 'Not enough credits — buy more to keep generating.' });
   }
 
   const jobId = 'job_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
@@ -161,9 +242,13 @@ app.post('/api/generate', async (req, res) => {
   // Lets you test the full frontend <-> backend flow before paying for
   // any real generations.
   if (!SEGMIND_API_KEY) {
-    jobs[jobId] = { status: 'queued', progress: 0, videoUrl: null, prompt, ratio, model, quality, duration };
+    jobs[jobId] = {
+      status: 'queued', progress: 0, videoUrl: null,
+      prompt, ratio, model, quality, duration,
+      userId, cost, refunded: false
+    };
     simulateMockRender(jobId);
-    return res.json({ jobId, mode: 'mock' });
+    return res.json({ jobId, mode: 'mock', credits: cost, balance: newBalance });
   }
 
   // LIVE MODE — real call to Segmind.
@@ -177,8 +262,8 @@ app.post('/api/generate', async (req, res) => {
       },
       body: JSON.stringify(Object.assign({
         prompt: prompt,
-        duration: parseInt(duration, 10) || 5,
-        resolution: quality || '720p',
+        duration: parseInt(duration, 10),
+        resolution: quality,
         aspect_ratio: image ? 'adaptive' : ratio,
         generate_audio: true
       }, image ? { first_frame_url: image } : {}))
@@ -188,14 +273,20 @@ app.post('/api/generate', async (req, res) => {
 
     if (!response.ok || !data?.request_id) {
       console.error('Segmind submit error:', response.status, JSON.stringify(data));
+      await refundCreditsFor(userId, cost);
       return res.status(502).json({ error: 'Video provider error', detail: data });
     }
 
-    jobs[jobId] = { status: 'processing', progress: 5, videoUrl: null, segmindRequestId: data.request_id };
+    jobs[jobId] = {
+      status: 'processing', progress: 5, videoUrl: null,
+      segmindRequestId: data.request_id,
+      userId, cost, refunded: false
+    };
     pollSegmindJob(jobId, data.request_id);
-    return res.json({ jobId, mode: 'live' });
+    return res.json({ jobId, mode: 'live', credits: cost, balance: newBalance });
   } catch (err) {
     console.error('Segmind request failed:', err);
+    await refundCreditsFor(userId, cost);
     return res.status(500).json({ error: 'Failed to reach video provider', detail: String(err) });
   }
 });
@@ -206,6 +297,16 @@ app.get('/api/status/:jobId', (req, res) => {
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
 });
+
+// Marks a job failed and refunds its credits exactly once.
+async function failJob(jobId, message) {
+  const job = jobs[jobId];
+  if (!job || job.refunded) return;
+  job.status = 'error';
+  job.error = message;
+  job.refunded = true;
+  await refundCreditsFor(job.userId, job.cost);
+}
 
 // ---- Poll Segmind's actual task status until it's done ----
 async function pollSegmindJob(jobId, requestId) {
@@ -234,8 +335,7 @@ async function pollSegmindJob(jobId, requestId) {
       }
 
       if (statusData.status === 'FAILED') {
-        jobs[jobId].status = 'error';
-        jobs[jobId].error = statusData?.error || 'Segmind reported generation failure';
+        await failJob(jobId, statusData?.error || 'Segmind reported generation failure');
         return;
       }
 
@@ -245,16 +345,14 @@ async function pollSegmindJob(jobId, requestId) {
       if (attempts < maxAttempts) {
         setTimeout(check, 5000);
       } else {
-        jobs[jobId].status = 'error';
-        jobs[jobId].error = 'Timed out waiting for Segmind';
+        await failJob(jobId, 'Timed out waiting for Segmind');
       }
     } catch (err) {
       console.error('Segmind poll error:', err);
       if (attempts < maxAttempts) {
         setTimeout(check, 5000);
       } else {
-        jobs[jobId].status = 'error';
-        jobs[jobId].error = 'Failed to poll Segmind status';
+        await failJob(jobId, 'Failed to poll Segmind status');
       }
     }
   };
