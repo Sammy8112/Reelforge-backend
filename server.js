@@ -401,7 +401,20 @@ async function failJob(jobId, message) {
 
 // ---- Poll Segmind's actual task status until it's done ----
 async function pollSegmindJob(jobId, requestId) {
-  const maxAttempts = 60; // video gen can take a few minutes
+  // Render time scales with clip length, and 2.5 is slower than 2.0.
+  // A 30s clip can take well over 15 minutes, so a flat timeout kills
+  // jobs that are still running fine on Segmind's side.
+  // Budget: 90s of waiting per second of video, floor of 8 minutes,
+  // ceiling of 30 minutes.
+  const job0 = jobs[jobId] || {};
+  const seconds = Number(job0.duration) || 5;
+  const slowModel = (job0.model || '').indexOf('2.5') !== -1;
+  const budgetMs = Math.min(
+    30 * 60 * 1000,
+    Math.max(8 * 60 * 1000, seconds * (slowModel ? 120 : 90) * 1000)
+  );
+  const maxAttempts = Math.ceil(budgetMs / 5000);
+  console.log(`Polling job ${jobId}: up to ${Math.round(budgetMs/60000)} min (${seconds}s clip)`);
   let attempts = 0;
 
   const check = async () => {
@@ -445,7 +458,15 @@ async function pollSegmindJob(jobId, requestId) {
       if (attempts < maxAttempts) {
         setTimeout(check, 5000);
       } else {
-        await failJob(jobId, 'Timed out waiting for Segmind');
+        // Segmind has very likely finished and billed us by now, so log the
+        // request id — the clip can still be pulled from the Segmind
+        // dashboard rather than being paid for and lost.
+        console.error(
+          `TIMEOUT after ${Math.round(attempts*5/60)} min. ` +
+          `Segmind request_id=${requestId} (user ${jobs[jobId]?.userId}) ` +
+          `— clip may exist and be recoverable.`
+        );
+        await failJob(jobId, 'Render took too long and timed out — credits refunded');
       }
     } catch (err) {
       console.error('Segmind poll error:', err);
